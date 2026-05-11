@@ -1,6 +1,8 @@
 <table>
 <tr>
-<td width="80" align="center">🧰</td>
+<td width="140" align="center">
+<img width="120" alt="A&S RTX Patcher Logo" src="https://github.com/Felix-Chaos/Actions-and-Stuff-RTX-Patcher/raw/main/A%26S%20Patcher/assets/resources/as_rtx_simple_logo_.png" />
+</td>
 <td>
 
 ## A&S RTX Patcher — External Tools
