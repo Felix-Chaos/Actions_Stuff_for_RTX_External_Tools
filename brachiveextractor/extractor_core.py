@@ -151,7 +151,14 @@ class ExtractorCore:
     ):
         """
         Extracts brarchives from a .zip/.mcpack or folder.
-        Saves extracted files to output_folder.
+        Produces a clean output that looks identical to a noBrachive pack:
+          - __brarchive/*.brarchive entries are extracted to their matching
+            directories at the pack root (e.g., animations.brarchive -> animations/)
+          - Nested brarchives follow the same pattern
+            (e.g., __brarchive/textures/particle.brarchive -> textures/particle/)
+          - 0-byte entries are skipped (they are placeholders; the real data
+            already exists as loose files)
+          - The __brarchive/ directory is removed after extraction
         Records job to db.json.
         """
         input_path = os.path.abspath(input_path)
@@ -164,7 +171,7 @@ class ExtractorCore:
         # Clean custom_name to prevent OS path errors/injection
         custom_name = re.sub(r'[\\/:*?"<>|]', "_", custom_name)
 
-        # 1. Normalize mapping to a workspace
+        # 1. Normalize input to a workspace
         workspace = os.path.join(output_folder, custom_name)
         if os.path.exists(workspace):
             shutil.rmtree(workspace)
@@ -185,88 +192,134 @@ class ExtractorCore:
             logger_callback("Unsupported input format.")
             return False
 
-        # 2. Find and extract brarchives
+        # 2. Find ALL __brarchive directories in the pack tree
+        #    (root level + inside subpacks like subpacks/SP0/, subpacks/SP1/, etc.)
+        brarchive_dirs = []
+        for root, dirs, _ in os.walk(workspace):
+            if "__brarchive" in dirs:
+                br_dir = os.path.join(root, "__brarchive")
+                brarchive_dirs.append(br_dir)
+
+        if not brarchive_dirs:
+            logger_callback("No __brarchive directories found in the pack.")
+            logger_callback("This pack does not use brarchive format. Nothing to extract.")
+            return False
+
+        logger_callback(f"Found {len(brarchive_dirs)} __brarchive directory(s).")
+
+        # 3. Process each __brarchive directory
         brarchives_found = 0
         extracted_files = 0
+        skipped_placeholders = 0
 
         mapping = {}  # relative path of brarchive -> list of extracted files
 
-        for root, _, files in os.walk(workspace):
-            for file in files:
-                if file.endswith(".brarchive"):
+        for brarchive_root in brarchive_dirs:
+            # The parent of __brarchive is where extracted files should go
+            # e.g., workspace/__brarchive -> extract to workspace/
+            # e.g., workspace/subpacks/SP0/__brarchive -> extract to workspace/subpacks/SP0/
+            pack_context = os.path.dirname(brarchive_root)
+            context_rel = os.path.relpath(pack_context, workspace)
+            if context_rel == ".":
+                context_rel = "(root)"
+            logger_callback(f"\nProcessing __brarchive in: {context_rel}")
+
+            for root, _, files in os.walk(brarchive_root):
+                for file in sorted(files):
+                    if not file.endswith(".brarchive"):
+                        continue
+
                     brarchives_found += 1
                     brarchive_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(brarchive_path, workspace)
+                    rel_to_workspace = os.path.relpath(brarchive_path, workspace)
+                    rel_to_brarchive_root = os.path.relpath(brarchive_path, brarchive_root)
 
-                    logger_callback(f"Found brarchive: {rel_path}")
+                    # Compute target directory relative to the pack context
+                    # e.g., "animations.brarchive" -> "animations"
+                    # e.g., "textures/particle.brarchive" -> "textures/particle"
+                    target_rel = os.path.splitext(rel_to_brarchive_root)[0]
+                    extract_dir = os.path.join(pack_context, target_rel)
+
+                    logger_callback(f"  {rel_to_brarchive_root} -> {target_rel}/")
 
                     try:
                         with open(brarchive_path, "rb") as f:
                             data = f.read()
 
-                        entry_map = deserialize(data)
-                        mapping[rel_path] = []
+                        # Skip empty archives (16-byte header only)
+                        if len(data) <= 16:
+                            logger_callback(f"    Skipped (empty archive)")
+                            continue
 
-                        # Create an extraction folder for this specific brarchive's contents IN PLACE
-                        base_name = os.path.splitext(os.path.basename(brarchive_path))[
-                            0
-                        ]
-                        extract_dir = os.path.join(
-                            os.path.dirname(brarchive_path), base_name
-                        )
-                        if os.path.isfile(extract_dir):
-                            extract_dir += "_extracted"
+                        entry_map = deserialize(data)
+                        mapping[rel_to_workspace] = []
 
                         os.makedirs(extract_dir, exist_ok=True)
 
                         for entry_name, content in entry_map.items():
-                            extracted_files += 1
                             out_file = os.path.join(extract_dir, entry_name)
+
+                            # Skip 0-byte placeholder entries — the real data
+                            # already exists as a loose file at the target location
+                            if len(content) == 0:
+                                skipped_placeholders += 1
+                                mapping[rel_to_workspace].append(
+                                    {
+                                        "entry_name": entry_name,
+                                        "extracted_path": os.path.relpath(
+                                            out_file, workspace
+                                        ).replace("\\", "/"),
+                                        "placeholder": True,
+                                    }
+                                )
+                                continue
+
+                            extracted_files += 1
                             os.makedirs(os.path.dirname(out_file), exist_ok=True)
 
                             with open(out_file, "wb") as out_f:
                                 out_f.write(content)
 
-                            mapping[rel_path].append(
+                            mapping[rel_to_workspace].append(
                                 {
                                     "entry_name": entry_name,
                                     "extracted_path": os.path.relpath(
                                         out_file, workspace
-                                    ),  # save path relative to workspace!
+                                    ).replace("\\", "/"),
+                                    "placeholder": False,
                                 }
                             )
 
-                        # Rename original brarchive to .bak so Minecraft can load the loose files directly if tested inside game
-                        bak_path = brarchive_path + ".bak"
-                        if os.path.exists(bak_path):
-                            os.remove(bak_path)
-                        os.rename(brarchive_path, bak_path)
-
                     except BrArchiveError as e:
-                        logger_callback(f"Error parsing {rel_path}: {e}")
+                        logger_callback(f"    Error parsing: {e}")
                     except Exception as e:
-                        logger_callback(f"Unexpected error: {e}")
+                        logger_callback(f"    Unexpected error: {e}")
 
-        if brarchives_found == 0:
-            logger_callback("No .brarchive files found in the pack.")
-            shutil.rmtree(workspace)
-            return False
+        # 4. Remove all __brarchive directories now that everything is extracted
+        for brarchive_root in brarchive_dirs:
+            try:
+                shutil.rmtree(brarchive_root)
+            except Exception as e:
+                logger_callback(f"Warning: Failed to remove {os.path.relpath(brarchive_root, workspace)}: {e}")
+        logger_callback(f"Removed {len(brarchive_dirs)} __brarchive/ directory(s).")
 
-        # 3. Save job to DB
+        # 5. Save job to DB
         job_id = str(datetime.now().timestamp())
         self.db[job_id] = {
             "custom_name": custom_name,
             "timestamp": datetime.now().isoformat(),
             "original_input": input_path,
             "mapping": mapping,
-            "workspace": workspace,  # We keep the workspace to repack easily
+            "workspace": workspace,
         }
         self._save_db()
 
-        logger_callback(f"Successfully processed {brarchives_found} brarchives.")
-        logger_callback(
-            f"Extracted {extracted_files} total files to: {os.path.join(output_folder, custom_name)}"
-        )
+        logger_callback(f"--- Extraction Summary ---")
+        logger_callback(f"Brarchives processed: {brarchives_found}")
+        logger_callback(f"Files extracted: {extracted_files}")
+        logger_callback(f"Placeholders skipped: {skipped_placeholders}")
+        logger_callback(f"Output: {workspace}")
+        logger_callback(f"--------------------------")
         return True
 
     def reverse_folder(self, workspace: str, custom_name: str, logger_callback=print):
